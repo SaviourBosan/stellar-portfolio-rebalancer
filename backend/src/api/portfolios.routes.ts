@@ -21,6 +21,7 @@ import { buildRebalancePlan, buildBatchRebalancePlan } from '../services/rebalan
 
 import { logger } from '../utils/logger.js'
 import { getErrorObject, getErrorMessage } from '../utils/helpers.js'
+import { redactString, redactObject } from '../utils/secretRedactor.js'
 import { ok, fail } from '../utils/apiResponse.js'
 import { ConflictError } from '../types/index.js'
 import { createPortfolioSchema, updatePortfolioSchema, portfolioExportQuerySchema, rebalancePortfolioSchema, portfolioHistoryQuerySchema, portfolioRebalanceHistoryQuerySchema, rebalanceHistoryExportQuerySchema, exportScheduleSchema, createDraftSchema, updateDraftSchema, portfolioSummaryQuerySchema, batchRebalancePlansSchema } from './validation.js'
@@ -45,21 +46,6 @@ function mapRebalanceOptions(body: any): ExecuteRebalanceOptions {
 
 export const portfoliosRouter = Router()
 
-
-portfoliosRouter.get('/portfolios', async (req: Request, res: Response) => {
-    try {
-        const search = req.query.search as string || ''
-        const limit = parseInt(req.query.limit as string) || 20
-        const offset = parseInt(req.query.offset as string) || 0
-        const includeArchived = req.query.include_archived === 'true'
-
-        const portfolios = await portfolioStorage.searchPortfolios(search, limit, offset, includeArchived)
-        return ok(res, { portfolios, limit, offset })
-    } catch (error) {
-        logger.error('[ERROR] Search portfolios failed', { error: getErrorObject(error) })
-        return fail(res, 500, 'INTERNAL_ERROR', getErrorMessage(error))
-    }
-})
 
 const stellarService = new StellarService()
 const reflectorService = new ReflectorService()
@@ -734,14 +720,35 @@ portfoliosRouter.get('/user/:address/portfolios', async (req: Request, res: Resp
 
 portfoliosRouter.get('/portfolios', async (req: Request, res: Response) => {
     try {
+        const search = (req.query.search as string) || ''
         const address = (req.query.userAddress || req.query.address) as string | undefined
-        let list: Portfolio[] = []
-        if (address) {
-            list = await portfolioStorage.getUserPortfolios(address)
-        } else {
-            list = await portfolioStorage.getAllPortfolios()
-        }
-        return ok(res, { portfolios: list })
+        const includeArchived = req.query.include_archived === 'true'
+
+        // Cursor pagination: `cursor` is the id of the last item from the
+        // previous page. It is stable across inserts/deletes because it is
+        // anchored to an item id rather than a numeric offset.
+        const rawLimit = parseInt(req.query.limit as string, 10)
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20
+        const cursor = typeof req.query.cursor === 'string' && req.query.cursor.length > 0
+            ? req.query.cursor
+            : undefined
+
+        const { portfolios, nextCursor, total } = await portfolioStorage.searchPortfoliosPage({
+            search,
+            address,
+            includeArchived,
+            limit,
+            cursor,
+        })
+
+        return ok(res, {
+            portfolios,
+            limit,
+            cursor: cursor ?? null,
+            nextCursor: nextCursor ?? null,
+            count: portfolios.length,
+            total,
+        })
     } catch (error) {
         logger.error('[ERROR] Get portfolios list failed', { error: getErrorObject(error) })
         return fail(res, 500, 'INTERNAL_ERROR', getErrorMessage(error))
@@ -963,6 +970,8 @@ portfoliosRouter.post('/portfolio/:id/rebalance', idempotencyMiddleware, validat
             const failureReason = innerError instanceof ConflictError
                 ? 'Rebalance conflict: execution already in progress'
                 : 'Rebalance execution failed due to an unexpected error';
+            const rawErrorMessage = innerError instanceof Error ? innerError.message : String(innerError);
+            const sanitizedDiagnostics = redactString(rawErrorMessage);
 
             try {
                 await rebalanceHistoryService.recordRebalanceEvent({
@@ -976,7 +985,9 @@ portfoliosRouter.post('/portfolio/:id/rebalance', idempotencyMiddleware, validat
                     details: {
                         actor: 'user',
                         source: 'api',
+                        outcome: 'failed',
                         failureReason,
+                        diagnosticContext: sanitizedDiagnostics,
                     },
                 });
             } catch (histErr) {
